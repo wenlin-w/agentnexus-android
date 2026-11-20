@@ -1,0 +1,77 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+# Signs and publishes the app. The tag comes from the private development
+# repository (scripts/github.sh):
+#   vX.Y.Z      main's source: built here, published as the latest release
+#   vX.Y.Z-rcN  a commit of the branch "rc" holding the APK built there,
+#               unsigned: signed here, published as a pre-release
+# The signing key is in the environment "release" (Settings → Environments):
+#   ANDROID_KEYSTORE_B64   base64 of the keystore (android-release.jks)
+#   ANDROID_KEYSTORE_PASS  its password
+# Every release must be signed with the same key, or phones refuse the upgrade.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+
+      - name: build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          v=${TAG#v}
+          case "$TAG" in
+            *-*)
+              [ -f "agentnexus-$v-unsigned.apk" ] || { echo "$TAG has no agentnexus-$v-unsigned.apk" >&2; exit 1; }
+              mv "agentnexus-$v-unsigned.apk" unsigned.apk
+              cp RC.md "$RUNNER_TEMP/notes.md"
+              ;;
+            *)
+              [ "$(tr -d ' \n' < VERSION)" = "$v" ] || { echo "tag $TAG does not match VERSION" >&2; exit 1; }
+              UNSIGNED=1 ./build.sh
+              mv "build/agentnexus-$v-unsigned.apk" unsigned.apk
+              prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$TAG^" 2>/dev/null || true)
+              git log --no-merges --format='- %s' "${prev:+$prev..}$TAG" > "$RUNNER_TEMP/notes.md"
+              ;;
+          esac
+
+      - name: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          [ -n "$KEYSTORE_B64" ] && [ -n "$ANDROID_KEYSTORE_PASS" ] || { echo "the signing secrets of the environment \"release\" are not set" >&2; exit 1; }
+          ks="$RUNNER_TEMP/release.jks"
+          echo "$KEYSTORE_B64" | base64 -d > "$ks"
+          bt="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p dist
+          apk="dist/agentnexus-${TAG#v}.apk"
+          "$bt/apksigner" sign --ks "$ks" --ks-pass env:ANDROID_KEYSTORE_PASS --ks-key-alias agentnexus --out "$apk" unsigned.apk
+          rm -f "$ks" "$apk.idsig"
+          "$bt/apksigner" verify --print-certs "$apk" | grep -i 'SHA-256 digest'
+          (cd dist && sha256sum *.apk > SHA256SUMS)
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$TAG" in
+            *-*) gh release create "$TAG" dist/* --title "Android App $TAG" --notes-file "$RUNNER_TEMP/notes.md" --prerelease --latest=false ;;
+            *) gh release create "$TAG" dist/* --title "Android App $TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest ;;
+          esac
